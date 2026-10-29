@@ -115,9 +115,18 @@
     showView("view-password");
     $("#password-form").current_password.focus();
   }
-  function enterPanel() {
+  async function enterPanel() {
     showView("view-panel");
     $("#whoami").textContent = "Sesión: " + (state.user || "");
+    // Tras iniciar sesión con el formulario no hay lista de tipos cargada: se pide al servidor.
+    if (!state.types || !state.types.length) {
+      try {
+        const me = await api("/api/admin/me");
+        state.types = me.license_types || [];
+      } catch (e) {
+        if (!handleAuthError(e)) toast(e.message, true);
+      }
+    }
     fillTypes();
     switchTab("dashboard");
     startAutoRefresh();
@@ -125,6 +134,10 @@
   function fillTypes() {
     const sel = $("#license-type");
     sel.textContent = "";
+    if (!state.types || !state.types.length) {
+      sel.append(el("option", { value: "", text: "Sin tipos configurados" }));
+      return;
+    }
     for (const t of state.types) sel.append(el("option", { value: t, text: t }));
   }
 
