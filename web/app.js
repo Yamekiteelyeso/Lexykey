@@ -3,7 +3,7 @@
 (function () {
   const $ = (s, r = document) => r.querySelector(s);
   const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
-  const state = { csrf: null, user: null, page: 1, apage: 1, timer: null, lastKeys: [] };
+  const state = { csrf: null, user: null, page: 1, apage: 1, timer: null, tick: null, lastKeys: [], clockOffset: 0 };
 
   const STATUS_LABEL = { pending: "Pendiente", active: "Activa", expired: "Expirada", revoked: "Revocada" };
   const PRESET_LABEL = { "1d": "1 día", "7d": "7 días", "30d": "30 días", "90d": "90 días", permanent: "Permanente" };
@@ -204,8 +204,9 @@
     state.timer = setInterval(() => {
       if (!$("[data-pane=dashboard]").hidden) loadStats();
     }, 15000);
+    state.tick = setInterval(tickRemaining, 1000);
   }
-  function stopAutoRefresh() { clearInterval(state.timer); }
+  function stopAutoRefresh() { clearInterval(state.timer); clearInterval(state.tick); }
 
   function handleAuthError(e) {
     if (e.status === 401) {
@@ -340,15 +341,28 @@
     if (dv) p.set("device", dv);
     try {
       const r = await api("/api/admin/licenses?" + p.toString());
+      state.clockOffset = r.server_time - Date.now() / 1000;
       if (state.page > r.pages) { state.page = r.pages; return loadLicenses(); }
       const body = $("#lic-body");
       body.textContent = "";
       if (!r.items.length) {
-        body.append(el("tr", {}, [el("td", { colspan: "11", class: "muted", text: "Sin resultados." })]));
+        body.append(el("tr", {}, [el("td", { colspan: "13", class: "muted", text: "Sin resultados." })]));
       }
       for (const it of r.items) body.append(licenseRow(it));
+      tickRemaining();
       $("#page-info").textContent = `Página ${r.page} de ${r.pages} · ${r.total} licencias`;
     } catch (e) { if (!handleAuthError(e)) toast(e.message, true); }
+  }
+
+  // Tiempo restante en vivo, calculado con la hora del servidor.
+  function tickRemaining() {
+    const now = Date.now() / 1000 + state.clockOffset;
+    for (const c of $$(".remain")) {
+      const exp = Number(c.dataset.exp);
+      if (!exp) continue;
+      const r = Math.floor(exp - now);
+      c.textContent = r <= 0 ? "Expirada" : fmtRemaining(r);
+    }
   }
 
   function licenseRow(it) {
@@ -364,15 +378,35 @@
     if (it.status !== "revoked") actions.append(mk("Revocar", () => doAction(it, "revoke", "Revocar licencia", "La licencia dejará de funcionar de inmediato.", true), "danger"));
     if (it.device_bound) actions.append(mk("Reset HWID", () => doAction(it, "reset-hwid", "Restablecer HWID", "Se liberará el dispositivo actual. La cuenta de Roblox NO se desvincula.", false)));
     if (it.roblox_user_id) actions.append(mk("Desvincular cuenta", () => doAction(it, "unlink-account", "Desvincular cuenta de Roblox", "Se quitará la cuenta y el dispositivo. La siguiente activación requerirá verificar la nueva cuenta.", true)));
+    actions.append(mk("Borrar", () => doAction(it, "delete", "Borrar licencia", "Se eliminará la licencia y no se puede deshacer.", true), "danger"));
+
+    let keyCell;
+    if (it.key) {
+      const cp = el("button", { class: "btn small", text: "Copiar" });
+      cp.addEventListener("click", () => copyText(it.key));
+      keyCell = el("td", {}, [el("code", { text: it.key }), " ", cp]);
+    } else {
+      keyCell = el("td", { class: "muted", text: "No disponible (generada antes del cambio)" });
+    }
+    let remain;
+    if (it.is_permanent) remain = "Permanente";
+    else if (it.status === "pending") remain = "Sin iniciar";
+    else if (it.status === "revoked") remain = "Revocada";
+    else if (it.status === "expired") remain = "Expirada";
+    else remain = "…";
+    const remainCell = el("td", { class: "remain", "data-exp": (!it.is_permanent && it.expires_at && it.status === "active") ? String(it.expires_at) : "", text: remain });
+
     return el("tr", {}, [
       el("td", { text: String(it.id) }),
-      el("td", {}, [el("code", { text: it.key_hint })]),
+      keyCell,
       el("td", {}, [badge(it.status)]),
+      remainCell,
       el("td", { text: it.is_permanent ? "Permanente" : `${Math.round(it.duration_seconds / 86400 * 10) / 10} d` }),
       el("td", { text: fmtDate(it.created_at) }),
       el("td", { text: fmtDate(it.activated_at) }),
       el("td", { text: it.is_permanent ? "—" : fmtDate(it.expires_at) }),
       el("td", { text: acc }),
+      el("td", { text: it.last_ip || "—" }),
       el("td", { text: dev }),
       el("td", { text: fmtDate(it.last_validated_at) }),
       el("td", {}, [actions]),
@@ -394,11 +428,12 @@
     try {
       const { license: l, history, server_time: srv } = await api(`/api/admin/licenses/${id}`);
       const rows = [
-        ["Identificador", l.id], ["Key", l.key_hint], ["Estado", STATUS_LABEL[l.status] || l.status],
+        ["Identificador", l.id], ["Key", l.key || "No disponible (generada antes del cambio)"], ["Estado", STATUS_LABEL[l.status] || l.status],
         ["Tipo", l.license_type], ["Duración", l.is_permanent ? "Permanente" : fmtRemaining(l.duration_seconds)],
         ["Creada", fmtDate(l.created_at)], ["Activada", fmtDate(l.activated_at)],
         ["Expira", l.is_permanent ? "Nunca" : fmtDate(l.expires_at)],
         ["Tiempo restante", fmtRemaining(l.status === "active" && !l.is_permanent ? Math.max(0, l.expires_at - srv) : null)],
+        ["IP de activación", l.activated_ip || "—"], ["IP última validación", l.last_ip || "—"],
         ["Cuenta Roblox", l.roblox_username ? `${l.roblox_display} (@${l.roblox_username}, ID ${l.roblox_user_id})` : "—"],
         ["Dispositivo", l.device_bound ? `Vinculado (huella ${l.device_fingerprint}…, origen ${l.device_source})` : "Sin vincular"],
         ["Primera vinculación", fmtDate(l.device_first_bound_at)], ["Última vinculación", fmtDate(l.device_bound_at)],
