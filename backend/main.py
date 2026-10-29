@@ -21,6 +21,7 @@ from functools import wraps
 from pathlib import Path
 
 from flask import Flask, g, jsonify, request, send_from_directory
+from cryptography.fernet import Fernet, InvalidToken
 
 try:  # Argon2id preferred when available
     from argon2 import PasswordHasher
@@ -48,6 +49,7 @@ def load_config(overrides=None):
         "DB_PATH": env("LEXY_DB_PATH", str(BASE_DIR.parent / "data" / "lexyhub.db")),
         "SECRET": env("LEXY_SECRET_KEY", ""),
         "PEPPER": env("LEXY_KEY_PEPPER", ""),
+        "FERNET": env("LEXY_FERNET_KEY", ""),
         "BOOTSTRAP_PASSWORD": env("LEXY_BOOTSTRAP_PASSWORD", "admin"),
         "SESSION_HOURS": float(env("LEXY_SESSION_HOURS", "8")),
         "IDLE_MINUTES": float(env("LEXY_IDLE_MINUTES", "60")),
@@ -77,20 +79,25 @@ def load_config(overrides=None):
         missing = [n for n, k in (("LEXY_SECRET_KEY", "SECRET"), ("LEXY_KEY_PEPPER", "PEPPER")) if len(cfg[k]) < 32]
         if missing:
             raise RuntimeError("Production requires strong (>=32 chars) values for: " + ", ".join(missing))
+        try:
+            Fernet(cfg["FERNET"].encode())
+        except Exception:
+            raise RuntimeError("Production requires LEXY_FERNET_KEY (generate with: "
+                               "python -c \"from cryptography.fernet import Fernet;print(Fernet.generate_key().decode())\")")
         if cfg["ROBLOX_VERIFY"] != "profile":
             raise RuntimeError("Production requires LEXY_ROBLOX_VERIFY=profile")
     else:
         # Dev convenience: persist random secrets next to the DB so keys survive restarts.
-        if not cfg["PEPPER"] or not cfg["SECRET"]:
+        if not cfg["PEPPER"] or not cfg["SECRET"] or not cfg["FERNET"]:
             sec_path = Path(cfg["DB_PATH"]).with_suffix(".devsecrets.json")
             sec_path.parent.mkdir(parents=True, exist_ok=True)
             data = {}
             if sec_path.exists():
                 data = json.loads(sec_path.read_text())
             changed = False
-            for k in ("SECRET", "PEPPER"):
+            for k in ("SECRET", "PEPPER", "FERNET"):
                 if not data.get(k):
-                    data[k] = secrets.token_hex(32)
+                    data[k] = Fernet.generate_key().decode() if k == "FERNET" else secrets.token_hex(32)
                     changed = True
             if changed:
                 sec_path.write_text(json.dumps(data))
@@ -100,6 +107,7 @@ def load_config(overrides=None):
                     pass
             cfg["SECRET"] = cfg["SECRET"] or data["SECRET"]
             cfg["PEPPER"] = cfg["PEPPER"] or data["PEPPER"]
+            cfg["FERNET"] = cfg["FERNET"] or data["FERNET"]
     return cfg
 
 
@@ -224,6 +232,17 @@ def create_app(overrides=None):
         conn = g.pop("db", None)
         if conn is not None:
             conn.close()
+
+    fernet = Fernet(cfg["FERNET"].encode())
+
+    def key_plain(row):
+        """Key completa para el administrador. None si la licencia es anterior al cifrado."""
+        if not row["key_enc"]:
+            return None
+        try:
+            return fernet.decrypt(row["key_enc"].encode()).decode()
+        except InvalidToken:
+            return None
 
     def hmac_hex(tag, value):
         return hmac.new(cfg["PEPPER"].encode(), f"{tag}:{value}".encode(), hashlib.sha256).hexdigest()
@@ -458,8 +477,13 @@ def create_app(overrides=None):
         return "active"
 
     def license_json(r, t, resets=None):
+        remaining = None
+        if not r["is_permanent"] and r["expires_at"] is not None and r["status"] == "active":
+            remaining = max(0, r["expires_at"] - t)
         out = {
-            "id": r["id"], "key_hint": r["key_hint"], "license_type": r["license_type"],
+            "id": r["id"], "key": key_plain(r), "key_hint": r["key_hint"], "license_type": r["license_type"],
+            "remaining_seconds": remaining, "server_time": t,
+            "activated_ip": r["activated_ip"], "last_ip": r["last_ip"],
             "status": eff_status(r, t), "is_permanent": bool(r["is_permanent"]),
             "duration_seconds": r["duration_seconds"],
             "created_at": r["created_at"], "activated_at": r["activated_at"], "expires_at": r["expires_at"],
@@ -517,10 +541,10 @@ def create_app(overrides=None):
                 k = new_key()
                 try:
                     cur = c.execute(
-                        "INSERT INTO licenses (key_hash, key_hint, license_type, duration_seconds, is_permanent, status,"
-                        " created_at, created_by) VALUES (?,?,?,?,?, 'pending', ?, ?)",
-                        (hmac_hex("key", k), "LEXY-****-****-****-" + k[-4:], ltype, seconds,
-                         1 if permanent else 0, t, g.admin["id"]))
+                        "INSERT INTO licenses (key_hash, key_hint, key_enc, license_type, duration_seconds,"
+                        " is_permanent, status, created_at, created_by) VALUES (?,?,?,?,?,?, 'pending', ?, ?)",
+                        (hmac_hex("key", k), "LEXY-****-****-****-" + k[-4:], fernet.encrypt(k.encode()).decode(),
+                         ltype, seconds, 1 if permanent else 0, t, g.admin["id"]))
                 except sqlite3.IntegrityError:  # astronomically unlikely duplicate: retry
                     continue
                 keys.append({"id": cur.lastrowid, "key": k})
@@ -652,6 +676,18 @@ def create_app(overrides=None):
         audit("license.unlink_account", "success", lid, g.admin, reason)
         return jsonify({"ok": True, "message": "Cuenta desvinculada. La siguiente activación requerirá verificar la nueva cuenta."})
 
+    @app.post("/api/admin/licenses/<int:lid>/delete")
+    @admin_required()
+    def delete_license(lid):
+        res, e = simple_action(lid, "delete", "Borrado desde el panel")
+        if e:
+            return e
+        r, reason = res
+        # Se registra antes de borrar; el id queda en el texto porque la FK se pondrá a NULL.
+        audit("license.delete", "success", None, g.admin, f"id={lid};{reason}")
+        db().execute("DELETE FROM licenses WHERE id=?", (lid,))
+        return jsonify({"ok": True, "message": "Licencia borrada."})
+
     # ======================================================================= admin: stats / audit
     @app.get("/api/admin/stats")
     @admin_required()
@@ -771,7 +807,8 @@ def create_app(overrides=None):
                 elif r["hwid_hash"] is not None and not hmac.compare_digest(r["hwid_hash"], hh):
                     resp = reject("hwid_mismatch", "Esta key está vinculada a otro dispositivo.", 403, r["id"])
                 elif r["hwid_hash"] is not None:  # fully bound and matching -> valid
-                    c.execute("UPDATE licenses SET last_validated_at=? WHERE id=?", (t, r["id"]))
+                    c.execute("UPDATE licenses SET last_validated_at=?, last_ip=? WHERE id=?",
+                              (t, client_ip(), r["id"]))
                     r = get_license(r["id"])
                     resp = jsonify(client_payload(r, t))
                 elif mode == "validate":
@@ -817,8 +854,10 @@ def create_app(overrides=None):
         c.execute(
             "UPDATE licenses SET status='active', activated_at=COALESCE(activated_at, ?), expires_at=?,"
             " roblox_user_id=?, roblox_username=?, roblox_display=?, hwid_hash=?, hwid_source=?,"
-            " hwid_first_bound_at=COALESCE(hwid_first_bound_at, ?), hwid_bound_at=?, last_validated_at=? WHERE id=?",
-            (t, expires, p["uid"], uname, udisp, hmac_hex("hwid", p["hwid"]), p["src"], t, t, t, r["id"]))
+            " hwid_first_bound_at=COALESCE(hwid_first_bound_at, ?), hwid_bound_at=?, last_validated_at=?,"
+            " activated_ip=COALESCE(activated_ip, ?), last_ip=? WHERE id=?",
+            (t, expires, p["uid"], uname, udisp, hmac_hex("hwid", p["hwid"]), p["src"], t, t, t,
+             client_ip(), client_ip(), r["id"]))
         c.execute("DELETE FROM roblox_challenges WHERE license_id=?", (r["id"],))
         audit("license.activate" if first_activation else "license.rebind", "success", r["id"], None,
               "first activation" if first_activation else "device rebound after reset")
@@ -858,6 +897,11 @@ def init_db(cfg):
     try:
         conn.execute("PRAGMA journal_mode = WAL")
         conn.executescript((BASE_DIR / "schema.sql").read_text())
+        # Migración: bases creadas antes de añadir estas columnas.
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(licenses)")}
+        for col in ("key_enc", "activated_ip", "last_ip"):
+            if col not in cols:
+                conn.execute(f"ALTER TABLE licenses ADD COLUMN {col} TEXT")
         conn.commit()
     finally:
         conn.close()
