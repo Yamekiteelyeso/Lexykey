@@ -3,5 +3,7 @@ Flask==3.1.3
 Werkzeug==3.1.7
 # Recomendado en producción (Argon2id). Si no se instala, el backend usa scrypt.
 argon2-cffi==23.1.0
+# Cifrado de las keys (para que el admin pueda verlas)
+cryptography==46.0.6
 # Servidor WSGI de producción
 gunicorn==23.0.0
